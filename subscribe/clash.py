@@ -247,6 +247,12 @@ VMESS_SUPPORTED_CIPHERS = ["auto", "aes-128-gcm", "chacha20-poly1305", "none"]
 
 SPECIAL_PROTOCOLS = set(["vless", "tuic", "hysteria", "hysteria2", "anytls"])
 
+VLESS_MLKEM_X25519_PLUS_PREFIX = "mlkem768x25519plus"
+VLESS_MLKEM_X25519_PLUS_MODES = ("native", "xorpub", "random")
+VLESS_MLKEM_X25519_PLUS_RTTS = ("1rtt", "0rtt")
+VLESS_MLKEM_X25519_PLUS_PADDING_LIMIT = 20
+VLESS_MLKEM_X25519_PLUS_KEY_SIZES = (32, 1184)
+
 # xtls-rprx-direct and xtls-rprx-origin are deprecated and no longer supported
 # XTLS_FLOWS = set(["xtls-rprx-direct", "xtls-rprx-origin", "xtls-rprx-vision"])
 
@@ -290,9 +296,43 @@ def check_ports(port: str, ranges: str, protocol: str) -> bool:
     return True
 
 
+def verify_vless_encryption(encryption: str) -> bool:
+    if not encryption or encryption == "none":
+        return True
+
+    parts = encryption.split(".")
+    if (
+        len(parts) < 4
+        or parts[0] != VLESS_MLKEM_X25519_PLUS_PREFIX
+        or parts[1] not in VLESS_MLKEM_X25519_PLUS_MODES
+        or parts[2] not in VLESS_MLKEM_X25519_PLUS_RTTS
+    ):
+        return False
+
+    for key in parts[3:]:
+        if len(key) < VLESS_MLKEM_X25519_PLUS_PADDING_LIMIT:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+            return False
+
+        try:
+            content = key + "=" * (-len(key) % 4)
+            decoded = base64.urlsafe_b64decode(content)
+        except:
+            return False
+
+        if len(decoded) not in VLESS_MLKEM_X25519_PLUS_KEY_SIZES:
+            return False
+
+    return True
+
+
 def verify(item: dict, mihomo: bool = True) -> bool:
     if not item or type(item) != dict or "type" not in item:
         return False
+
+    # remove dialer-proxy because target proxy maybe not exists
+    item.pop("dialer-proxy", None)
 
     try:
         # name must be string
@@ -493,7 +533,23 @@ def verify(item: dict, mihomo: bool = True) -> bool:
                     if mode not in ["http", "tls"]:
                         return False
         elif item["type"] == "http" or item["type"] == "socks5":
-            authentication = "userpass"
+            for field in ["username", "password"]:
+                value = item.get(field, None)
+                if not value:
+                    continue
+
+                if not isinstance(value, str) and not utils.is_number(value):
+                    return False
+
+                if utils.is_number(value):
+                    value = QuotedStr(value)
+                else:
+                    value = utils.trim(value)
+
+                item[field] = value
+
+            return True
+
         elif mihomo and item["type"] in SPECIAL_PROTOCOLS:
             if item["type"] == "anytls":
                 if "alpn" in item and type(item["alpn"]) != list:
@@ -505,10 +561,16 @@ def verify(item: dict, mihomo: bool = True) -> bool:
 
             elif item["type"] == "vless":
                 authentication = "uuid"
+
+                # see: https://github.com/MetaCubeX/mihomo/blob/Alpha/transport/vless/encryption/factory.go#L12
+                encryption = utils.trim(item.get("encryption", ""))
+                if not verify_vless_encryption(encryption):
+                    return False
+
                 network = utils.trim(item.get("network", "tcp"))
 
                 # mihomo: https://wiki.metacubex.one/config/proxies/vless/#network
-                network_opts = ["ws", "tcp", "grpc", "http", "h2"] if mihomo else ["ws", "tcp", "grpc"]
+                network_opts = ["ws", "tcp", "grpc", "http", "h2", "xhttp"] if mihomo else ["ws", "tcp", "grpc"]
 
                 if network not in network_opts:
                     return False
@@ -538,9 +600,13 @@ def verify(item: dict, mihomo: bool = True) -> bool:
                         return False
                 if "reality-opts" in item:
                     reality_opts = item.get("reality-opts", {})
-                    if not reality_opts or type(reality_opts) != dict:
-                        return False
-                    if "public-key" not in reality_opts or type(reality_opts["public-key"]) != str:
+                    if (
+                        not reality_opts
+                        or type(reality_opts) != dict
+                        or "public-key" not in reality_opts
+                        or "short-id" not in reality_opts
+                        or type(reality_opts["public-key"]) != str
+                    ):
                         return False
 
                     content = utils.trim(reality_opts["public-key"])
@@ -549,18 +615,40 @@ def verify(item: dict, mihomo: bool = True) -> bool:
                     if len(public_key) != 32:
                         return False
 
-                    if "short-id" in reality_opts:
-                        short_id = reality_opts["short-id"]
-                        if type(short_id) != str:
-                            if utils.is_number(short_id):
-                                short_id = str(short_id)
-                            else:
-                                return False
-
-                        if len(short_id) != 8 or not is_hex(short_id):
+                    short_id = reality_opts["short-id"]
+                    if type(short_id) != str:
+                        if utils.is_number(short_id):
+                            short_id = str(short_id)
+                        else:
                             return False
 
-                        reality_opts["short-id"] = QuotedStr(short_id)
+                    if short_id:
+                        try:
+                            sib = bytes.fromhex(short_id)
+                            if len(sib) > 8:
+                                return False
+                        except ValueError:
+                            return False
+
+                    reality_opts["short-id"] = QuotedStr(short_id)
+                if "xhttp-opts" in item:
+                    if network != "xhttp":
+                        return False
+
+                    xhttp_opts = item.get("xhttp-opts", {})
+                    if not xhttp_opts or type(xhttp_opts) != dict:
+                        return False
+                    if "path" in xhttp_opts and type(xhttp_opts["path"]) != str:
+                        return False
+                    if "host" in xhttp_opts and type(xhttp_opts["host"]) != str:
+                        return False
+
+                    if "mode" in xhttp_opts:
+                        xhttp_mode = utils.trim(xhttp_opts.get("mode", ""))
+                        if xhttp_mode and xhttp_mode not in ["stream-one", "stream-up", "packet-up"]:
+                            return False
+                    if "headers" in xhttp_opts and type(xhttp_opts["headers"]) != dict:
+                        return False
             elif item["type"] == "tuic":
                 # mihomo: https://wiki.metacubex.one/config/proxies/tuic
                 token = wrap(item.get("token", ""))
@@ -616,6 +704,10 @@ def verify(item: dict, mihomo: bool = True) -> bool:
                         continue
 
                     traffic = item.get(property, "")
+                    if traffic == "null":
+                        item.pop(property)
+                        continue
+
                     if traffic and utils.is_number(traffic):
                         traffic = str(traffic)
 
